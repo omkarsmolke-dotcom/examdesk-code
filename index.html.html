@@ -1,0 +1,392 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ExamDesk source code</title>
+<style>body{margin:0;background:#f7f5ff;color:#23213c;font:16px system-ui}main{max-width:1100px;margin:auto;padding:24px 16px}h1{margin:0}p{line-height:1.5}a{color:#5138b8}details{background:white;margin:12px 0;border:1px solid #ddd8ed;border-radius:10px}summary{padding:12px;cursor:pointer;font-weight:650}pre{margin:0;padding:14px;border-top:1px solid #ddd8ed;overflow:auto;background:#fff;font:13px/1.5 monospace;tab-size:2}</style>
+<main><h1>ExamDesk source code</h1><p>Open a section to read the code. Swipe sideways within a code block to see long lines.</p><p><a href="https://examdesk-timetable.vocalfir514.chatgpt.site/">Open the live ExamDesk calendar</a></p>
+<details open><summary>worker/index.js</summary><pre><code>const categories = [&#x27;Exam&#x27;, &#x27;Study&#x27;, &#x27;Assignment&#x27;, &#x27;Personal&#x27;];
+const json = (data, status = 200) =&gt; Response.json(data, {status, headers: {&#x27;Cache-Control&#x27;:&#x27;no-store&#x27;}});
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const accountId = request.headers.get(&#x27;oai-authenticated-user-id&#x27;);
+    const email = request.headers.get(&#x27;oai-authenticated-user-email&#x27;)?.trim().toLowerCase() || &#x27;&#x27;;
+    const owner = Boolean(email &amp;&amp; email === env.OWNER_EMAIL);
+    if (!accountId) {
+      return new Response(&#x27;Sign in to open ExamDesk.&#x27;, {status:401, headers:{&#x27;Cache-Control&#x27;:&#x27;no-store&#x27;}});
+    }
+    if (url.pathname === &#x27;/&#x27;) {
+      return new Response(owner ? page : page.replace(ownerButton, &#x27;&#x27;), {headers:{
+        &#x27;Content-Type&#x27;:&#x27;text/html; charset=utf-8&#x27;, &#x27;Cache-Control&#x27;:&#x27;no-store&#x27;,
+        &#x27;Content-Security-Policy&#x27;:&quot;default-src &#x27;self&#x27;; script-src &#x27;unsafe-inline&#x27;; style-src &#x27;unsafe-inline&#x27;; img-src &#x27;self&#x27; data:; base-uri &#x27;none&#x27;; form-action &#x27;self&#x27;&quot;,
+        &#x27;X-Content-Type-Options&#x27;:&#x27;nosniff&#x27;
+      }});
+    }
+    if (url.pathname === &#x27;/api/owner/events&#x27;) {
+      if (!owner) return json({error:&#x27;Page not found&#x27;}, 404);
+      if (request.method !== &#x27;GET&#x27;) return json({error:&#x27;Method not supported.&#x27;}, 405);
+      try {
+        const {results} = await env.DB.prepare(
+          &#x27;SELECT title, kind, day, start, end, location, notes, account_id, account_email FROM events WHERE account_id &lt;&gt; ? ORDER BY account_email, account_id, day, start, title&#x27;
+        ).bind(accountId).all();
+        return json(results);
+      } catch (error) {
+        console.error(&#x27;Owner timetable query failed&#x27;, error);
+        return json({error:&#x27;Could not load timetables.&#x27;}, 503);
+      }
+    }
+    const exporting = url.pathname === &#x27;/calendar.ics&#x27;;
+    if (!exporting &amp;&amp; url.pathname !== &#x27;/api/events&#x27;) return json({error:&#x27;Page not found&#x27;}, 404);
+    const ownEvents = &#x27;(account_id = ? OR (? = 1 AND account_id IS NULL))&#x27;;
+    const scope = [accountId, Number(owner)];
+    if (exporting &amp;&amp; request.method !== &#x27;GET&#x27;) return json({error:&#x27;Method not supported.&#x27;}, 405);
+    try {
+      if (request.method === &#x27;GET&#x27;) {
+        const {results} = await env.DB.prepare(
+          &#x27;SELECT id, title, kind, day, start, end, location, notes FROM events WHERE &#x27; + ownEvents + &#x27; ORDER BY day, start, title&#x27;
+        ).bind(...scope).all();
+        if (exporting) {
+          return new Response(calendarFile(results), {headers:{
+            &#x27;Content-Type&#x27;:&#x27;text/calendar; charset=utf-8&#x27;,
+            &#x27;Content-Disposition&#x27;:&#x27;attachment; filename=&quot;examdesk-timetable.ics&quot;&#x27;,
+            &#x27;Cache-Control&#x27;:&#x27;private, no-store&#x27;,
+            &#x27;X-Content-Type-Options&#x27;:&#x27;nosniff&#x27;
+          }});
+        }
+        return json(results);
+      }
+      if (request.headers.get(&#x27;Origin&#x27;) !== url.origin) return json({error:&#x27;Request origin was rejected.&#x27;}, 403);
+      if (![&#x27;POST&#x27;,&#x27;DELETE&#x27;].includes(request.method)) return json({error:&#x27;Method not supported.&#x27;}, 405);
+      const raw = await request.text();
+      if (raw.length &gt; 8000) return json({error:&#x27;Event is too large.&#x27;}, 413);
+      let input;
+      try { input = JSON.parse(raw); } catch { return json({error:&#x27;Invalid event data.&#x27;}, 400); }
+      if (!input || typeof input !== &#x27;object&#x27;) return json({error:&#x27;Invalid event data.&#x27;}, 400);
+      const {id,title,kind,day,start,end,location,notes} = input;
+      if (id &amp;&amp; !/^[0-9a-f-]{36}$/.test(id)) return json({error:&#x27;Invalid event ID.&#x27;}, 400);
+      if (request.method === &#x27;DELETE&#x27;) {
+        if (!id) return json({error:&#x27;Missing event ID.&#x27;}, 400);
+        const result = await env.DB.prepare(&#x27;DELETE FROM events WHERE id=? AND &#x27; + ownEvents).bind(id,...scope).run();
+        if (!result.meta.changes) return json({error:&#x27;Event not found.&#x27;},404);
+        return json({ok:true});
+      }
+      const limit = (value, max) =&gt; typeof value === &#x27;string&#x27; &amp;&amp; value.length &lt;= max;
+      const parsed = new Date(day + &#x27;T12:00:00Z&#x27;);
+      const validDay = /^\d{4}-\d{2}-\d{2}$/.test(day) &amp;&amp; Number.isFinite(+parsed) &amp;&amp; parsed.toISOString().slice(0,10) === day;
+      const time = /^([01]\d|2[0-3]):[0-5]\d$/;
+      if (!limit(title,120) || !title.trim() || !categories.includes(kind) || !validDay ||
+          !(start === &#x27;&#x27; || time.test(start)) || !(end === &#x27;&#x27; || (time.test(end) &amp;&amp; start &amp;&amp; end &gt; start)) ||
+          !limit(location,150) || !limit(notes,1500)) return json({error:&#x27;Enter a title, valid date and an end time after the start.&#x27;}, 400);
+      const data = [title.trim(),kind,day,start,end,location.trim(),notes.trim()];
+      if (id) {
+        const result = await env.DB.prepare(&#x27;UPDATE events SET title=?, kind=?, day=?, start=?, end=?, location=?, notes=?, account_id=?, account_email=? WHERE id=? AND &#x27; + ownEvents).bind(...data,accountId,email,id,...scope).run();
+        if (!result.meta.changes) return json({error:&#x27;This event has already been removed.&#x27;},404);
+      } else {
+        await env.DB.prepare(&#x27;INSERT INTO events (title,kind,day,start,end,location,notes,id,account_id,account_email) VALUES (?,?,?,?,?,?,?,?,?,?)&#x27;).bind(...data,crypto.randomUUID(),accountId,email).run();
+      }
+      return json({ok:true});
+    } catch (error) {
+      console.error(&#x27;Calendar storage failed&#x27;, error);
+      return json({error:&#x27;Calendar storage is temporarily unavailable.&#x27;}, 503);
+    }
+  }
+};
+
+const ownerButton = &#x27;&lt;button class=&quot;secondary&quot; id=&quot;ownerView&quot;&gt;Member timetables&lt;/button&gt;&#x27;;
+
+function calendarFile(list) {
+  const escapeIcs = value =&gt; value.replace(/\\/g,&#x27;\\\\&#x27;).replace(/\r?\n/g,&#x27;\\n&#x27;).replace(/([,;])/g,&#x27;\\$1&#x27;);
+  const stamp = new Date().toISOString().replace(/[-:]/g,&#x27;&#x27;).replace(/\.\d+Z$/,&#x27;Z&#x27;);
+  const lines = [&#x27;BEGIN:VCALENDAR&#x27;,&#x27;VERSION:2.0&#x27;,&#x27;PRODID:-//ExamDesk//Timetable//EN&#x27;,&#x27;CALSCALE:GREGORIAN&#x27;];
+  for (const e of list) {
+    const day = e.day.replaceAll(&#x27;-&#x27;,&#x27;&#x27;);
+    const timed = time =&gt; new Date(e.day+&#x27;T&#x27;+time+&#x27;:00+05:30&#x27;).toISOString().replace(/[-:]/g,&#x27;&#x27;).replace(/\.\d+Z$/,&#x27;Z&#x27;);
+    lines.push(&#x27;BEGIN:VEVENT&#x27;,&#x27;UID:&#x27;+e.id+&#x27;@examdesk&#x27;,&#x27;DTSTAMP:&#x27;+stamp,&#x27;SUMMARY:&#x27;+escapeIcs(e.title),&#x27;CATEGORIES:&#x27;+e.kind,
+      e.start ? &#x27;DTSTART:&#x27;+timed(e.start) : &#x27;DTSTART;VALUE=DATE:&#x27;+day);
+    if (e.end) lines.push(&#x27;DTEND:&#x27;+timed(e.end));
+    if (e.location) lines.push(&#x27;LOCATION:&#x27;+escapeIcs(e.location));
+    if (e.notes) lines.push(&#x27;DESCRIPTION:&#x27;+escapeIcs(e.notes));
+    lines.push(&#x27;END:VEVENT&#x27;);
+  }
+  lines.push(&#x27;END:VCALENDAR&#x27;,&#x27;&#x27;);
+  const byteLength = char =&gt; new TextEncoder().encode(char).length;
+  const folded = lines.map(line =&gt; {
+    let output = &#x27;&#x27;, count = 0;
+    for (const char of line) {
+      const size = byteLength(char);
+      if (count + size &gt; 75) { output += &#x27;\r\n &#x27;; count = 1; }
+      output += char;
+      count += size;
+    }
+    return output;
+  });
+  return folded.join(&#x27;\r\n&#x27;);
+}
+
+const page = String.raw`&lt;!doctype html&gt;
+&lt;html lang=&quot;en&quot;&gt;&lt;head&gt;&lt;meta charset=&quot;utf-8&quot;&gt;&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1&quot;&gt;&lt;title&gt;ExamDesk | Private timetable&lt;/title&gt;
+&lt;style&gt;
+:root{--ink:#23213c;--muted:#69667e;--line:#eae7f2;--purple:#6247db;--wash:#f5f2ff;--paper:#fff;--shadow:0 10px 32px #29204708;color-scheme:light}
+*{box-sizing:border-box}body{margin:0;background:#f8f7fc;color:var(--ink);font:14px Inter,system-ui,sans-serif}button,input,select,textarea{font:inherit}button{cursor:pointer}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--purple);outline-offset:3px}button{color:inherit}svg{width:19px;height:19px;stroke:currentColor;fill:none;stroke-width:1.65;stroke-linecap:round;stroke-linejoin:round;flex:none}
+header{background:#fff;border-bottom:1px solid var(--line)}.top{max-width:1520px;margin:auto;padding:15px 4%;display:flex;align-items:center;justify-content:space-between}.brand{display:flex;align-items:center;gap:11px;font-weight:800;font-size:21px;letter-spacing:-.8px}.logo{width:38px;height:38px;display:grid;place-items:center;background:var(--purple);color:white;border-radius:11px}.privacy{background:#f3f0fc;color:#514485;border:0;border-radius:24px;padding:8px 13px;display:flex;align-items:center;gap:7px;font-weight:650;font-size:12px}.privacy svg{width:15px;height:15px}
+main{max-width:1520px;margin:auto;padding:34px 4% 36px}.intro{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-bottom:23px}h1{font-size:clamp(27px,4vw,43px);margin:0 0 5px;letter-spacing:-.055em;line-height:1.1}p{margin:0;color:var(--muted);line-height:1.5}.primary,.secondary,.square,.seg button,.quiet{border:1px solid var(--line);background:white;border-radius:9px;padding:9px 12px;font-weight:650;display:inline-flex;align-items:center;justify-content:center;gap:7px;white-space:nowrap}.primary{background:var(--purple);color:#fff;border-color:var(--purple);padding:10px 15px;box-shadow:0 3px 7px #6247db30}.primary:hover{background:#5136c5}.secondary:hover,.square:hover,.quiet:hover{background:var(--wash)}.quiet{text-decoration:none;border:none;font-size:12px;color:var(--muted);background:transparent}.square{padding:7px}.layout{display:grid;grid-template-columns:minmax(0,1fr) 290px;gap:19px;align-items:start}.panel{background:#fff;border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);overflow:hidden}
+.toolbar{padding:16px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.range,.controls{display:flex;align-items:center;gap:7px}.range h2{margin:0 7px 0 0;font-size:20px;letter-spacing:-.04em}.seg{display:flex;gap:1px;padding:3px;background:#f6f5fa;border-radius:9px}.seg button{border:0;background:transparent;padding:6px 9px;color:var(--muted);font-size:12px}.seg button.active{background:white;box-shadow:0 1px 4px #24203816;color:var(--purple)}.filters{display:flex;align-items:center;flex-wrap:wrap;gap:8px;border-top:1px solid var(--line);padding:10px 16px}.filters select,.filters input{border:1px solid var(--line);border-radius:8px;background:#fff;padding:7px 9px;color:var(--ink);min-width:0}.filters input{flex:1;max-width:260px}.filters .quiet{margin-left:auto}
+.weekdays,.grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr))}.weekdays{background:#faf9fd;border-top:1px solid var(--line);text-align:center}.weekdays span{padding:10px 2px;font-size:10px;font-weight:750;letter-spacing:.09em;color:var(--muted);text-transform:uppercase}.cell{min-height:99px;border-top:1px solid var(--line);border-right:1px solid var(--line);padding:6px;min-width:0;cursor:pointer}.cell:nth-child(7n){border-right:0}.cell.out{background:#fbfafd;color:#817d95}.cell.selected{background:#f5f2ff;box-shadow:inset 0 0 0 1px #c8bafa}.grid.week .cell{min-height:315px}.date{border:0;background:transparent;color:inherit;width:26px;height:26px;border-radius:8px;font-weight:700;font-size:12px;padding:0}.date.today{background:var(--purple);color:white}.event{--tone:#5e42c1;--tint:#eee7ff;display:block;width:100%;border:0;border-left:3px solid var(--tone);padding:5px;margin-top:4px;border-radius:5px;background:var(--tint);color:var(--tone);font-size:11px;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700}.event:hover{filter:brightness(.96)}[data-kind=Study]{--tone:#0d725b;--tint:#dff6ed}[data-kind=Assignment]{--tone:#a04b12;--tint:#fff0d9}[data-kind=Personal]{--tone:#235a9b;--tint:#e4f0ff}[data-kind=Exam]{--tone:#6544c4;--tint:#eee7ff}.more{border:0;background:transparent;font-size:11px;color:var(--purple);padding:4px}
+aside{display:grid;gap:14px}.side{padding:18px}.side h2{font-size:17px;letter-spacing:-.03em;margin:0 0 4px}.side .sub{font-size:12px;margin-bottom:13px}.side .secondary{width:100%;margin-top:12px;color:var(--purple)}.entry{width:100%;border:0;border-bottom:1px solid var(--line);background:transparent;text-align:left;display:flex;align-items:center;gap:10px;padding:10px 0;color:var(--ink)}.entry:last-child{border-bottom:0}.entry:hover strong{color:var(--purple)}.badge{min-width:42px;text-align:center;padding:6px;border-radius:9px;background:var(--tint);color:var(--tone);font-size:9px;text-transform:uppercase;font-weight:750}.badge b{display:block;font-size:17px;line-height:1.05}.entry strong{display:block;overflow-wrap:anywhere;font-size:13px}.entry small{display:block;color:var(--muted);margin-top:3px}.empty{padding:12px 0;font-size:13px}.agenda{padding:8px 18px 20px;min-height:260px}.legend{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:13px;font-size:12px;color:var(--muted)}.legend span{display:flex;align-items:center;gap:6px}.legend i{width:8px;height:8px;border-radius:100%;background:var(--tone)}.notice{padding:8px 4px;color:var(--muted);font-size:12px;min-height:30px}.notice.error,.form-error{color:#a52542}.form-error{font-size:13px;min-height:18px;margin-top:8px}
+dialog{width:min(470px,calc(100% - 28px));border:1px solid var(--line);border-radius:16px;color:var(--ink);padding:21px;box-shadow:0 25px 90px #23213c42}#members{width:min(620px,calc(100% - 28px));max-height:85vh}#member{width:100%;margin:6px 0 12px;padding:8px;border:1px solid var(--line);border-radius:8px;background:white}.member-event{border-top:1px solid var(--line);padding:11px 0;overflow-wrap:anywhere}.member-event p{white-space:pre-wrap}.top .range{flex-wrap:wrap;justify-content:end}.top .secondary{font-size:12px;padding:6px 9px}dialog::backdrop{background:#25203d70}.dialog-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:15px}.dialog-head h2{margin:0;font-size:21px;letter-spacing:-.04em}.fields{display:grid;grid-template-columns:1fr 1fr;gap:12px}.fields label{display:grid;gap:5px;font-size:12px;font-weight:700}.fields .full{grid-column:1/-1}.fields input,.fields select,.fields textarea{border:1px solid #ddd8ed;border-radius:8px;padding:8px;width:100%;min-width:0;color:var(--ink);background:white}.fields textarea{resize:vertical;min-height:65px}.dialog-foot{display:flex;align-items:center;justify-content:end;gap:8px;margin-top:8px}.danger{color:#a52542;margin-right:auto}[hidden]{display:none!important}
+@media(max-width:1040px){.layout{grid-template-columns:minmax(0,1fr) 235px}.side{padding:14px}}@media(max-width:820px){.layout{grid-template-columns:1fr}aside{grid-template-columns:1fr 1fr}.categories{grid-column:1/-1}.legend{grid-template-columns:repeat(4,1fr)}}@media(max-width:520px){main{padding:22px 3%}.top{padding:12px 4%}.intro{align-items:center}.intro p{font-size:12px}.primary{padding:8px 9px;font-size:12px}.toolbar{padding:10px;gap:8px}.range h2{font-size:17px}.controls .secondary{padding:7px}.cell{min-height:76px;padding:2px}.event{font-size:9px;padding:3px 2px}.event time{display:none}.filters{padding:9px;gap:5px}.filters input{width:35%}.filters .quiet{padding:6px 3px}.side{padding:12px}aside{gap:8px}.legend{gap:5px}.legend span{font-size:10px}}
+&lt;/style&gt;&lt;/head&gt;
+&lt;body&gt;
+&lt;header&gt;&lt;div class=&quot;top&quot;&gt;&lt;div class=&quot;brand&quot;&gt;&lt;span class=&quot;logo&quot; data-icon=&quot;calendar&quot;&gt;&lt;/span&gt;ExamDesk&lt;/div&gt;&lt;div class=&quot;range&quot;&gt;${ownerButton}&lt;button class=&quot;privacy&quot; id=&quot;privacy&quot;&gt;&lt;span data-icon=&quot;lock&quot;&gt;&lt;/span&gt;Restricted access&lt;/button&gt;&lt;/div&gt;&lt;/div&gt;&lt;/header&gt;
+&lt;main&gt;
+&lt;div class=&quot;intro&quot;&gt;&lt;div&gt;&lt;h1&gt;Exam timetable&lt;/h1&gt;&lt;p&gt;Plan your exams, study sessions, and deadlines.&lt;/p&gt;&lt;/div&gt;&lt;button class=&quot;primary&quot; id=&quot;add&quot;&gt;&lt;span data-icon=&quot;plus&quot;&gt;&lt;/span&gt;New event&lt;/button&gt;&lt;/div&gt;
+&lt;div class=&quot;layout&quot;&gt;
+&lt;section class=&quot;panel&quot; aria-label=&quot;Calendar&quot;&gt;
+&lt;div class=&quot;toolbar&quot;&gt;&lt;div class=&quot;range&quot;&gt;&lt;h2 id=&quot;period&quot;&gt;&lt;/h2&gt;&lt;button class=&quot;square&quot; id=&quot;prev&quot; aria-label=&quot;Previous period&quot; data-icon=&quot;left&quot;&gt;&lt;/button&gt;&lt;button class=&quot;square&quot; id=&quot;next&quot; aria-label=&quot;Next period&quot; data-icon=&quot;right&quot;&gt;&lt;/button&gt;&lt;/div&gt;&lt;div class=&quot;controls&quot;&gt;&lt;button class=&quot;secondary&quot; id=&quot;today&quot;&gt;Today&lt;/button&gt;&lt;div class=&quot;seg&quot; aria-label=&quot;Calendar view&quot;&gt;&lt;button data-view=&quot;month&quot;&gt;Month&lt;/button&gt;&lt;button data-view=&quot;week&quot;&gt;Week&lt;/button&gt;&lt;button data-view=&quot;agenda&quot;&gt;Agenda&lt;/button&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;
+&lt;div class=&quot;filters&quot;&gt;&lt;input id=&quot;search&quot; type=&quot;search&quot; placeholder=&quot;Search events&quot; aria-label=&quot;Search events&quot;&gt;&lt;select id=&quot;filter&quot; aria-label=&quot;Filter by event type&quot;&gt;&lt;option value=&quot;&quot;&gt;All types&lt;/option&gt;&lt;option&gt;Exam&lt;/option&gt;&lt;option&gt;Study&lt;/option&gt;&lt;option&gt;Assignment&lt;/option&gt;&lt;option&gt;Personal&lt;/option&gt;&lt;/select&gt;&lt;a id=&quot;export&quot; class=&quot;quiet&quot; href=&quot;/calendar.ics&quot; download=&quot;examdesk-timetable.ics&quot; title=&quot;Download your timetable as an ICS file&quot;&gt;&lt;span data-icon=&quot;download&quot;&gt;&lt;/span&gt;Export&lt;/a&gt;&lt;/div&gt;
+&lt;div id=&quot;calendar&quot;&gt;&lt;/div&gt;
+&lt;/section&gt;
+&lt;aside&gt;
+&lt;section class=&quot;panel side&quot;&gt;&lt;h2 id=&quot;selected&quot;&gt;&lt;/h2&gt;&lt;p class=&quot;sub&quot; id=&quot;selectedFull&quot;&gt;&lt;/p&gt;&lt;div id=&quot;dayEvents&quot;&gt;&lt;/div&gt;&lt;button class=&quot;secondary&quot; id=&quot;addDay&quot;&gt;&lt;span data-icon=&quot;plus&quot;&gt;&lt;/span&gt;Add to this day&lt;/button&gt;&lt;/section&gt;
+&lt;section class=&quot;panel side&quot;&gt;&lt;h2&gt;Upcoming exams&lt;/h2&gt;&lt;p class=&quot;sub&quot;&gt;Next on your timetable&lt;/p&gt;&lt;div id=&quot;upcoming&quot;&gt;&lt;/div&gt;&lt;/section&gt;
+&lt;section class=&quot;panel side categories&quot;&gt;&lt;h2&gt;Calendar key&lt;/h2&gt;&lt;div class=&quot;legend&quot; id=&quot;legend&quot;&gt;&lt;/div&gt;&lt;/section&gt;
+&lt;/aside&gt;&lt;/div&gt;
+&lt;div class=&quot;notice&quot; id=&quot;notice&quot; role=&quot;status&quot;&gt;&lt;/div&gt;
+&lt;/main&gt;
+&lt;dialog id=&quot;editor&quot;&gt;&lt;form id=&quot;form&quot;&gt;&lt;div class=&quot;dialog-head&quot;&gt;&lt;h2 id=&quot;editorTitle&quot;&gt;New event&lt;/h2&gt;&lt;button class=&quot;square&quot; type=&quot;button&quot; data-close=&quot;editor&quot; aria-label=&quot;Close&quot; data-icon=&quot;close&quot;&gt;&lt;/button&gt;&lt;/div&gt;
+&lt;div class=&quot;fields&quot;&gt;&lt;label class=&quot;full&quot;&gt;Event title&lt;input name=&quot;title&quot; required maxlength=&quot;120&quot; placeholder=&quot;e.g. Mathematics final&quot;&gt;&lt;/label&gt;&lt;label&gt;Date&lt;input type=&quot;date&quot; name=&quot;day&quot; required&gt;&lt;/label&gt;&lt;label&gt;Type&lt;select name=&quot;kind&quot;&gt;&lt;option&gt;Exam&lt;/option&gt;&lt;option&gt;Study&lt;/option&gt;&lt;option&gt;Assignment&lt;/option&gt;&lt;option&gt;Personal&lt;/option&gt;&lt;/select&gt;&lt;/label&gt;&lt;label&gt;Start time&lt;input type=&quot;time&quot; name=&quot;start&quot;&gt;&lt;/label&gt;&lt;label&gt;End time&lt;input type=&quot;time&quot; name=&quot;end&quot;&gt;&lt;/label&gt;&lt;label class=&quot;full&quot;&gt;Location&lt;input name=&quot;location&quot; maxlength=&quot;150&quot; placeholder=&quot;Room, building, or meeting link&quot;&gt;&lt;/label&gt;&lt;label class=&quot;full&quot;&gt;Notes&lt;textarea name=&quot;notes&quot; maxlength=&quot;1500&quot;&gt;&lt;/textarea&gt;&lt;/label&gt;&lt;/div&gt;
+&lt;div class=&quot;form-error&quot; id=&quot;formError&quot; role=&quot;alert&quot;&gt;&lt;/div&gt;&lt;div class=&quot;dialog-foot&quot;&gt;&lt;button type=&quot;button&quot; class=&quot;secondary danger&quot; id=&quot;remove&quot;&gt;Delete&lt;/button&gt;&lt;button type=&quot;button&quot; class=&quot;secondary&quot; data-close=&quot;editor&quot;&gt;Cancel&lt;/button&gt;&lt;button class=&quot;primary&quot; type=&quot;submit&quot; id=&quot;save&quot;&gt;Save event&lt;/button&gt;&lt;/div&gt;&lt;/form&gt;&lt;/dialog&gt;
+&lt;dialog id=&quot;access&quot;&gt;&lt;div class=&quot;dialog-head&quot;&gt;&lt;h2&gt;Restricted access&lt;/h2&gt;&lt;button class=&quot;square&quot; data-close=&quot;access&quot; aria-label=&quot;Close&quot; data-icon=&quot;close&quot;&gt;&lt;/button&gt;&lt;/div&gt;&lt;p&gt;The owner manages the invite list in Sites sharing settings. Sign in with your invited account to use your timetable.&lt;/p&gt;&lt;/dialog&gt;
+&lt;dialog id=&quot;members&quot;&gt;&lt;div class=&quot;dialog-head&quot;&gt;&lt;h2&gt;Member timetables&lt;/h2&gt;&lt;button class=&quot;square&quot; data-close=&quot;members&quot; aria-label=&quot;Close&quot; data-icon=&quot;close&quot;&gt;&lt;/button&gt;&lt;/div&gt;
+&lt;label for=&quot;member&quot;&gt;Account&lt;/label&gt;&lt;select id=&quot;member&quot; hidden&gt;&lt;/select&gt;&lt;div id=&quot;memberEvents&quot; aria-live=&quot;polite&quot;&gt;&lt;/div&gt;&lt;/dialog&gt;
+&lt;script&gt;
+const $ = id =&gt; document.getElementById(id);
+const icons = {
+  calendar:&#x27;&lt;rect x=&quot;3&quot; y=&quot;5&quot; width=&quot;18&quot; height=&quot;16&quot; rx=&quot;3&quot;/&gt;&lt;path d=&quot;M7 3v4m10-4v4M3 10h18m-14 4h2m4 0h2m-8 3h2m4 0h2&quot;/&gt;&#x27;,
+  lock:&#x27;&lt;rect x=&quot;5&quot; y=&quot;10&quot; width=&quot;14&quot; height=&quot;11&quot; rx=&quot;2&quot;/&gt;&lt;path d=&quot;M8 10V7a4 4 0 0 1 8 0v3m-4 4v3&quot;/&gt;&#x27;,
+  plus:&#x27;&lt;path d=&quot;M12 5v14M5 12h14&quot;/&gt;&#x27;,
+  left:&#x27;&lt;path d=&quot;m15 6-6 6 6 6&quot;/&gt;&#x27;,
+  right:&#x27;&lt;path d=&quot;m9 6 6 6-6 6&quot;/&gt;&#x27;,
+  close:&#x27;&lt;path d=&quot;m6 6 12 12M18 6 6 18&quot;/&gt;&#x27;,
+  download:&#x27;&lt;path d=&quot;M12 3v12m-4-4 4 4 4-4M5 16v4h14v-4&quot;/&gt;&#x27;
+};
+for (const el of document.querySelectorAll(&#x27;[data-icon]&#x27;)) {
+  el.innerHTML = &#x27;&lt;svg viewBox=&quot;0 0 24 24&quot; aria-hidden=&quot;true&quot;&gt;&#x27; + icons[el.dataset.icon] + &#x27;&lt;/svg&gt;&#x27;;
+}
+const categoryNames = [&#x27;Exam&#x27;,&#x27;Study&#x27;,&#x27;Assignment&#x27;,&#x27;Personal&#x27;];
+const format = (date, options) =&gt; new Intl.DateTimeFormat(&#x27;en-IN&#x27;,options).format(date);
+const toDate = key =&gt; new Date(key + &#x27;T12:00:00&#x27;);
+const keyOf = date =&gt; [date.getFullYear(),String(date.getMonth()+1).padStart(2,&#x27;0&#x27;),String(date.getDate()).padStart(2,&#x27;0&#x27;)].join(&#x27;-&#x27;);
+const today = () =&gt; new Intl.DateTimeFormat(&#x27;sv-SE&#x27;,{timeZone:&#x27;Asia/Kolkata&#x27;,year:&#x27;numeric&#x27;,month:&#x27;2-digit&#x27;,day:&#x27;2-digit&#x27;}).format(new Date());
+const addDays = (date, n) =&gt; new Date(date.getFullYear(),date.getMonth(),date.getDate()+n,12);
+const weekStart = date =&gt; addDays(date,-((date.getDay()+6)%7));
+const safe = value =&gt; String(value).replace(/[&amp;&lt;&gt;&quot;&#x27;]/g,c =&gt; ({&#x27;&amp;&#x27;:&#x27;&amp;amp;&#x27;,&#x27;&lt;&#x27;:&#x27;&amp;lt;&#x27;,&#x27;&gt;&#x27;:&#x27;&amp;gt;&#x27;,&#x27;&quot;&#x27;:&#x27;&amp;quot;&#x27;,&quot;&#x27;&quot;:&#x27;&amp;#39;&#x27;})[c]);
+let selected = today(), anchor = toDate(selected), view = &#x27;month&#x27;, events = [], editing = &#x27;&#x27;, busy = false;
+$(&#x27;legend&#x27;).innerHTML = categoryNames.map(kind =&gt; &#x27;&lt;span data-kind=&quot;&#x27;+kind+&#x27;&quot;&gt;&lt;i&gt;&lt;/i&gt;&#x27;+kind+&#x27;&lt;/span&gt;&#x27;).join(&#x27;&#x27;);
+const timeLabel = e =&gt; e.start ? e.start + (e.end ? &#x27;–&#x27; + e.end : &#x27;&#x27;) : &#x27;All day&#x27;;
+const entry = (event, showDay) =&gt; {
+  const date = toDate(event.day);
+  const label = showDay ? format(date,{month:&#x27;short&#x27;}) : event.kind;
+  return &#x27;&lt;button class=&quot;entry&quot; data-event=&quot;&#x27;+event.id+&#x27;&quot;&gt;&lt;span class=&quot;badge&quot; data-kind=&quot;&#x27;+event.kind+&#x27;&quot;&gt;&#x27;+label+(showDay?&#x27;&lt;b&gt;&#x27;+date.getDate()+&#x27;&lt;/b&gt;&#x27;:&#x27;&#x27;)+&#x27;&lt;/span&gt;&lt;span&gt;&lt;strong&gt;&#x27;+safe(event.title)+&#x27;&lt;/strong&gt;&lt;small&gt;&#x27;+timeLabel(event)+(event.location?&#x27; · &#x27;+safe(event.location):&#x27;&#x27;)+&#x27;&lt;/small&gt;&lt;/span&gt;&lt;/button&gt;&#x27;;
+};
+const empty = message =&gt; &#x27;&lt;p class=&quot;empty&quot;&gt;&#x27;+message+&#x27;&lt;/p&gt;&#x27;;
+function filtered() {
+  const search = $(&#x27;search&#x27;).value.trim().toLowerCase();
+  const kind = $(&#x27;filter&#x27;).value;
+  return events.filter(e =&gt; (!kind || e.kind === kind) &amp;&amp; (!search || [e.title,e.location,e.notes].some(value =&gt; value.toLowerCase().includes(search))));
+}
+function periodBounds() {
+  if (view === &#x27;week&#x27;) {
+    const start = weekStart(anchor);
+    return [start,addDays(start,7)];
+  }
+  const year = anchor.getFullYear(), month = anchor.getMonth();
+  return [new Date(year,month,1,12),new Date(year,month+1,1,12)];
+}
+function insidePeriod(list) {
+  const [start,end] = periodBounds().map(keyOf);
+  return list.filter(e =&gt; e.day &gt;= start &amp;&amp; e.day &lt; end);
+}
+function render() {
+  const matches = filtered();
+  const [start,end] = periodBounds();
+  $(&#x27;period&#x27;).textContent = view === &#x27;week&#x27;
+    ? format(start,{month:&#x27;short&#x27;,day:&#x27;numeric&#x27;})+&#x27; – &#x27;+format(addDays(end,-1),{month:&#x27;short&#x27;,day:&#x27;numeric&#x27;,year:&#x27;numeric&#x27;})
+    : format(anchor,{month:&#x27;long&#x27;,year:&#x27;numeric&#x27;});
+  for (const btn of document.querySelectorAll(&#x27;[data-view]&#x27;)) {
+    btn.classList.toggle(&#x27;active&#x27;,btn.dataset.view === view);
+    btn.setAttribute(&#x27;aria-pressed&#x27;,String(btn.dataset.view === view));
+  }
+  if (view === &#x27;agenda&#x27;) {
+    $(&#x27;calendar&#x27;).innerHTML = &#x27;&lt;div class=&quot;agenda&quot;&gt;&#x27;+(insidePeriod(matches).map(e =&gt; entry(e,true)).join(&#x27;&#x27;) || empty(&#x27;No events match this month.&#x27;))+&#x27;&lt;/div&gt;&#x27;;
+  } else {
+    const first = view === &#x27;week&#x27; ? start : weekStart(start);
+    const count = view === &#x27;week&#x27; ? 7 : 42;
+    const weekdays = [&#x27;Mon&#x27;,&#x27;Tue&#x27;,&#x27;Wed&#x27;,&#x27;Thu&#x27;,&#x27;Fri&#x27;,&#x27;Sat&#x27;,&#x27;Sun&#x27;].map(day =&gt; &#x27;&lt;span&gt;&#x27;+day+&#x27;&lt;/span&gt;&#x27;).join(&#x27;&#x27;);
+    let cells = &#x27;&#x27;;
+    for (let i=0;i&lt;count;i++) {
+      const date = addDays(first,i), day = keyOf(date);
+      const dayEvents = matches.filter(e =&gt; e.day === day);
+      const cap = view === &#x27;week&#x27; ? 8 : 2;
+      const chips = dayEvents.slice(0,cap).map(e =&gt; &#x27;&lt;button class=&quot;event&quot; data-event=&quot;&#x27;+e.id+&#x27;&quot; data-kind=&quot;&#x27;+e.kind+&#x27;&quot; title=&quot;&#x27;+safe(e.title)+&#x27;&quot;&gt;&#x27;+(e.start?&#x27;&lt;time&gt;&#x27;+e.start+&#x27; &lt;/time&gt;&#x27;:&#x27;&#x27;)+safe(e.title)+&#x27;&lt;/button&gt;&#x27;).join(&#x27;&#x27;);
+      const more = dayEvents.length &gt; cap ? &#x27;&lt;button class=&quot;more&quot; data-select=&quot;&#x27;+day+&#x27;&quot;&gt;+&#x27;+(dayEvents.length-cap)+&#x27; more&lt;/button&gt;&#x27; : &#x27;&#x27;;
+      cells += &#x27;&lt;div class=&quot;cell&#x27;+(date.getMonth()!==anchor.getMonth()&amp;&amp;view===&#x27;month&#x27;?&#x27; out&#x27;:&#x27;&#x27;)+(day===selected?&#x27; selected&#x27;:&#x27;&#x27;)+&#x27;&quot; data-cell=&quot;&#x27;+day+&#x27;&quot;&gt;&lt;button class=&quot;date&#x27;+(day===today()?&#x27; today&#x27;:&#x27;&#x27;)+&#x27;&quot; data-select=&quot;&#x27;+day+&#x27;&quot; aria-label=&quot;&#x27;+format(date,{dateStyle:&#x27;full&#x27;})+&#x27;&quot; aria-pressed=&quot;&#x27;+(day===selected)+&#x27;&quot;&gt;&#x27;+date.getDate()+&#x27;&lt;/button&gt;&#x27;+chips+more+&#x27;&lt;/div&gt;&#x27;;
+    }
+    $(&#x27;calendar&#x27;).innerHTML = &#x27;&lt;div class=&quot;weekdays&quot;&gt;&#x27;+weekdays+&#x27;&lt;/div&gt;&lt;div class=&quot;grid &#x27;+view+&#x27;&quot;&gt;&#x27;+cells+&#x27;&lt;/div&gt;&#x27;;
+  }
+  const date = toDate(selected);
+  $(&#x27;selected&#x27;).textContent = selected === today() ? &#x27;Today&#x27; : format(date,{weekday:&#x27;long&#x27;});
+  $(&#x27;selectedFull&#x27;).textContent = format(date,{day:&#x27;numeric&#x27;,month:&#x27;long&#x27;,year:&#x27;numeric&#x27;});
+  $(&#x27;dayEvents&#x27;).innerHTML = matches.filter(e =&gt; e.day === selected).map(e =&gt; entry(e,false)).join(&#x27;&#x27;) || empty(&#x27;No events on this day.&#x27;);
+  $(&#x27;upcoming&#x27;).innerHTML = events.filter(e =&gt; e.kind === &#x27;Exam&#x27; &amp;&amp; e.day &gt;= today()).slice(0,5).map(e =&gt; entry(e,true)).join(&#x27;&#x27;) || empty(&#x27;No upcoming exams.&#x27;);
+}
+function navigate(n) {
+  anchor = view === &#x27;week&#x27; ? addDays(anchor,n*7) : new Date(anchor.getFullYear(),anchor.getMonth()+n,1,12);
+  selected = keyOf(anchor);
+  render();
+}
+function selectDay(day) {
+  selected = day;
+  anchor = toDate(day);
+  render();
+  $(&#x27;calendar&#x27;).querySelector(&#x27;.date[data-select=&quot;&#x27;+day+&#x27;&quot;]&#x27;)?.focus({preventScroll:true});
+}
+function openEditor(event) {
+  editing = event?.id || &#x27;&#x27;;
+  $(&#x27;form&#x27;).reset();
+  $(&#x27;form&#x27;).elements.day.value = event?.day || selected;
+  for (const name of [&#x27;title&#x27;,&#x27;kind&#x27;,&#x27;start&#x27;,&#x27;end&#x27;,&#x27;location&#x27;,&#x27;notes&#x27;]) if (event) $(&#x27;form&#x27;).elements[name].value = event[name];
+  $(&#x27;editorTitle&#x27;).textContent = editing ? &#x27;Edit event&#x27; : &#x27;New event&#x27;;
+  $(&#x27;remove&#x27;).hidden = !editing;
+  $(&#x27;formError&#x27;).textContent = &#x27;&#x27;;
+  $(&#x27;editor&#x27;).showModal();
+}
+function notice(message,error=false) {
+  $(&#x27;notice&#x27;).textContent = message;
+  $(&#x27;notice&#x27;).classList.toggle(&#x27;error&#x27;,error);
+}
+async function api(method=&#x27;GET&#x27;,body) {
+  const result = await fetch(&#x27;/api/events&#x27;,{method,headers:body?{&#x27;Content-Type&#x27;:&#x27;application/json&#x27;}:{},body:body?JSON.stringify(body):undefined});
+  if (result.redirected) throw new Error(&#x27;Sign in again and reload to update the timetable.&#x27;);
+  const data = await result.json();
+  if (!result.ok) throw new Error(data.error || &#x27;The calendar could not be updated.&#x27;);
+  return data;
+}
+async function load() {
+  events = await api();
+  render();
+}
+async function mutate(method, data) {
+  if (busy) return;
+  busy = true;
+  $(&#x27;save&#x27;).disabled = $(&#x27;remove&#x27;).disabled = true;
+  $(&#x27;formError&#x27;).textContent = &#x27;&#x27;;
+  try {
+    await api(method,data);
+    if (method !== &#x27;DELETE&#x27;) {
+      selected = data.day;
+      anchor = toDate(selected);
+    }
+    $(&#x27;editor&#x27;).close();
+    notice(method === &#x27;DELETE&#x27; ? &#x27;Event deleted.&#x27; : &#x27;Event saved.&#x27;);
+    try { await load(); } catch { notice(&#x27;The change was saved. Reload to refresh the timetable.&#x27;,true); }
+  } catch (error) {
+    $(&#x27;formError&#x27;).textContent = error.message;
+  } finally {
+    busy = false;
+    $(&#x27;save&#x27;).disabled = $(&#x27;remove&#x27;).disabled = false;
+  }
+}
+$(&#x27;form&#x27;).onsubmit = event =&gt; {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData($(&#x27;form&#x27;)));
+  if (data.end &amp;&amp; (!data.start || data.end &lt;= data.start)) {
+    $(&#x27;formError&#x27;).textContent = &#x27;Choose an end time after the start time.&#x27;;
+    return;
+  }
+  mutate(&#x27;POST&#x27;,{id:editing,...data});
+};
+$(&#x27;remove&#x27;).onclick = () =&gt; {
+  if (confirm(&#x27;Delete this event from your timetable?&#x27;)) mutate(&#x27;DELETE&#x27;,{id:editing});
+};
+$(&#x27;editor&#x27;).addEventListener(&#x27;cancel&#x27;,event =&gt; { if (busy) event.preventDefault(); });
+document.addEventListener(&#x27;click&#x27;,event =&gt; {
+  const target = event.target.closest(&#x27;[data-event],[data-select],[data-cell],[data-view],[data-close]&#x27;);
+  if (!target) return;
+  const data = target.dataset;
+  if (data.event) {
+    const item = events.find(e =&gt; e.id === data.event);
+    if (item) openEditor(item);
+  } else if (data.select || data.cell) {
+    selectDay(data.select || data.cell);
+  } else if (data.view) {
+    view = data.view;
+    render();
+  } else if (data.close &amp;&amp; !busy) {
+    $(data.close).close();
+  }
+});
+$(&#x27;prev&#x27;).onclick = () =&gt; navigate(-1);
+$(&#x27;next&#x27;).onclick = () =&gt; navigate(1);
+$(&#x27;today&#x27;).onclick = () =&gt; selectDay(today());
+$(&#x27;add&#x27;).onclick = $(&#x27;addDay&#x27;).onclick = () =&gt; openEditor();
+$(&#x27;privacy&#x27;).onclick = () =&gt; $(&#x27;access&#x27;).showModal();
+const memberView = $(&#x27;ownerView&#x27;);
+if (memberView) {
+  const picker = $(&#x27;member&#x27;);
+  const list = $(&#x27;memberEvents&#x27;);
+  let groups = new Map();
+  const displayMember = () =&gt; {
+    const group = groups.get(picker.value);
+    list.innerHTML = group ? group.events.map(e =&gt;
+      &#x27;&lt;article class=&quot;member-event&quot;&gt;&lt;strong&gt;&#x27;+safe(e.title)+&#x27;&lt;/strong&gt;&lt;p&gt;&#x27;+
+      format(toDate(e.day),{dateStyle:&#x27;medium&#x27;})+&#x27; · &#x27;+timeLabel(e)+&#x27; · &#x27;+safe(e.kind)+
+      (e.location?&#x27; · &#x27;+safe(e.location):&#x27;&#x27;)+&#x27;&lt;/p&gt;&#x27;+(e.notes?&#x27;&lt;p&gt;&#x27;+safe(e.notes)+&#x27;&lt;/p&gt;&#x27;:&#x27;&#x27;)+&#x27;&lt;/article&gt;&#x27;
+    ).join(&#x27;&#x27;) : empty(&#x27;No member events yet.&#x27;);
+  };
+  picker.onchange = displayMember;
+  memberView.onclick = async () =&gt; {
+    $(&#x27;members&#x27;).showModal();
+    picker.hidden = true;
+    list.textContent = &#x27;Loading timetables…&#x27;;
+    try {
+      const response = await fetch(&#x27;/api/owner/events&#x27;);
+      if (!response.ok) throw new Error(&#x27;Could not load timetables.&#x27;);
+      const records = await response.json();
+      groups = new Map();
+      for (const e of records) {
+        if (!groups.has(e.account_id)) groups.set(e.account_id,{email:e.account_email,events:[]});
+        const group = groups.get(e.account_id);
+        if (e.account_email) group.email = e.account_email;
+        group.events.push(e);
+      }
+      picker.replaceChildren(...Array.from(groups, ([id,group],i) =&gt; new Option(group.email || &#x27;Member &#x27;+(i+1),id)));
+      picker.hidden = !groups.size;
+      displayMember();
+    } catch {
+      list.textContent = &#x27;Could not load timetables. Close this panel and try again.&#x27;;
+    }
+  };
+}
+$(&#x27;search&#x27;).oninput = $(&#x27;filter&#x27;).onchange = render;
+
+render();
+notice(&#x27;Loading timetable…&#x27;);
+load().then(() =&gt; notice(&#x27;Times use India Standard Time (IST).&#x27;)).catch(() =&gt; notice(&#x27;Could not load the timetable. Reload to try again.&#x27;,true));
+&lt;/script&gt;&lt;/body&gt;&lt;/html&gt;`;
+</code></pre></details>
+<details ><summary>drizzle/0000_events.sql</summary><pre><code>CREATE TABLE events (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  day TEXT NOT NULL,
+  start TEXT NOT NULL,
+  end TEXT NOT NULL,
+  location TEXT NOT NULL,
+  notes TEXT NOT NULL
+);
+CREATE INDEX events_day ON events(day, start);
+</code></pre></details>
+<details ><summary>drizzle/0001_event_owners.sql</summary><pre><code>ALTER TABLE events ADD COLUMN account_id TEXT;
+ALTER TABLE events ADD COLUMN account_email TEXT;
+CREATE INDEX events_account_day ON events(account_id, day, start);
+</code></pre></details>
+</main></html>
